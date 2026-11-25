@@ -35,13 +35,18 @@ def prepare(folder, config, tasks, levels, methods, multiplier):
     random.Random(33550336).shuffle(jobs)
     dataset = {'cases': cases}
     # Compare everything before freezing any file, so a mismatched reuse cannot partially update inputs.
-    signature = dict(version='unified_columns_v1', **config, tasks=tasks, difficulties=levels,
+    signature = dict(version='unified_columns_v2', **config, tasks=tasks, difficulties=levels,
                      methods=methods, budget_multiplier=multiplier, temperature=0.7, max_tokens=2048,
                      source_sha256=source_hashes(), expected_runs=len(jobs), job_order=jobs,
                      expected_total_calls=sum(c['M'] * multiplier * len(methods) for c in cases),
-                     paper_exact_replication=False, prompt_version='vertical_columns_v2',
-                     generation='one whole model answer per API request; no retries or completion by code',
-                     budget='M is admissible reference count; 2M includes nested M checkpoint',
+                     paper_exact_replication=True, prompt_version='vertical_columns_v2',
+                     baseline_replication='history_baseline matches upstream evaluate_single_observation_set: '
+                     'verbatim create_prompt output, round budget, per-task max_retries, upstream prior-history semantics',
+                     baseline_max_retries={'boolean': 5, '3d': 3, 'causal': 3},
+                     generation='history_baseline replicates upstream rounds with retries; '
+                     'stratified/library methods keep one request per call without retries',
+                     budget='M is admissible reference count; 2M includes nested M checkpoint; '
+                     'for history_baseline these are sampling rounds, API calls may exceed them via retries',
                      strata='oracle complexity counts, no reference answers in prompts',
                      boolean_operator_order='sorted for reproducible prompts across processes',
                      cost_basis='optional configured USD/million token estimate; raw provider usage retained')
@@ -112,7 +117,7 @@ def main(task=None):
     folder = args.output.resolve()
     if args.report_only:
         protocol = json.loads((folder / 'protocol.json').read_text(encoding='utf-8'))
-        if protocol.get('version') != 'unified_columns_v1':
+        if protocol.get('version') != 'unified_columns_v2':
             raise ValueError('Use the original reporter for historical experiment formats')
         config = {key: protocol[key] for key in ('provider', 'model', 'base_url', 'key_env', 'thinking', 'input_price', 'output_price')}
         engine = configure_engine(config)

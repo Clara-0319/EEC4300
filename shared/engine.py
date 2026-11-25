@@ -9,8 +9,11 @@ import time
 from experiment_provider import LoggedClient, MODEL, BASE_URL, KEY_ENV
 from io_utils import write, sha
 from compositional.upstream import ROOT
-from matrix_adapters import adapter_for, compact, public_case
+from matrix_adapters import adapter_for, compact, public_case, \
+    upstream_error_text, upstream_error_detail, upstream_history_add
 from column_prompt_protocol import METHODS, STRATIFIED_METHODS, LIBRARY_METHODS, build_prompt
+
+MAX_RETRIES = {'boolean': 5, '3d': 3, 'causal': 3}
 
 
 def csv_write(path, rows):
@@ -95,7 +98,92 @@ class CurveAccumulator:
                 'valid_outside_reference': self.failures['valid_outside_reference'], 'recovered_by_complexity': dict(sorted(hist.items()))}
 
 
+def run_one_upstream(folder_text, case, budget_multiplier=2):
+    """Replicate the upstream baseline loop: round budget, per-task retries,
+    verbatim create_prompt output, and upstream prior-history semantics."""
+    if budget_multiplier not in (1, 2):
+        raise ValueError('Budget multiplier must be 1 or 2')
+    budget = budget_multiplier * case['M']
+    folder = Path(folder_text)
+    stem = case['case_id'] + '__history_baseline'
+    destination = folder / 'runs' / (stem + '.json')
+    log = folder / 'calls' / (stem + '.jsonl')
+    curve_path = folder / 'curves' / (stem + '.jsonl')
+    journal = folder / 'journals' / (stem + '.jsonl')
+    if destination.exists():
+        saved = json.loads(destination.read_text(encoding='utf-8'))
+        if saved['budget'] != budget:
+            raise ValueError('Saved result has a different budget')
+        return saved
+    if any(p.exists() for p in [log, curve_path, journal]):
+        raise RuntimeError('Partial run found; inspect instead of replaying paid calls: ' + stem)
+    for path in [destination, log, curve_path, journal]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    adapter = adapter_for(public_case(case))
+    client = LoggedClient(MODEL, BASE_URL, KEY_ENV, 0.7, 2048).attach(log, stem)
+    accumulator = CurveAccumulator(case)
+    history, history_seen, proposals, curves = [], set(), [], []
+    max_retries = MAX_RETRIES[case['task']]
+    start = time.perf_counter()
+    print(f"START {stem} M={case['M']} rounds={budget} max_retries={max_retries}", flush=True)
+    for index in range(budget):
+        client.slot_getter = lambda: index + 1
+        prompt = adapter.upstream_prompt(history)
+        with journal.open('a', encoding='utf-8') as handle:
+            handle.write(compact({'call': index+1, 'event': 'request_start', 'utc': datetime.now(timezone.utc).isoformat()}) + '\n')
+        response, payload, api_error, error_detail = None, None, False, None
+        attempts = 0
+        for attempt in range(max_retries):
+            attempts += 1
+            try:
+                response = client.query(prompt)
+            except RuntimeError:
+                api_error = True
+                error_detail = upstream_error_detail(adapter, max_retries,
+                                                     upstream_error_text(client.errors[-1]))
+                continue
+            payload = adapter.parse(response)
+            if payload is not None:
+                break
+        verdict = adapter.evaluate(payload)
+        upstream_history_add(adapter, case, history, history_seen, payload, error_detail)
+        proposal = {'index': index, 'call': index+1, 'payload': payload, 'attempts': attempts,
+                    'api_error': api_error, **verdict}
+        proposals.append(proposal)
+        curve = accumulator.add(payload, verdict, api_error)
+        report = client.report()
+        curve.update({'task': case['task'], 'difficulty': case['difficulty'], 'case_id': case['case_id'],
+            'method': 'history_baseline', 'M': case['M'], 'cumulative_prompt_tokens': client.usage['prompt_tokens'],
+            'cumulative_completion_tokens': client.usage['completion_tokens'], 'cumulative_total_tokens': client.usage['total_tokens'],
+            'cumulative_estimated_cost_usd': report['estimated_cost_usd'], 'elapsed_seconds': time.perf_counter()-start,
+            'last_finish_reason': client.records[-1].get('finish_reason', 'error'),
+            'last_usage': client.last_usage, 'target_complexity': None,
+            'target_match_count': None, 'payload_valid': verdict['valid'],
+            'payload_in_space': verdict['in_space'], 'payload_complexity': verdict['complexity'],
+            'attempts': attempts, 'max_retries': max_retries})
+        curves.append(curve)
+        with curve_path.open('a', encoding='utf-8') as handle:
+            handle.write(compact(curve) + '\n')
+        if curve['valid_outside_reference']:
+            write(folder / 'audit_failure.json', {'case_id': case['case_id'], 'method': 'history_baseline', 'proposal': proposal})
+            raise RuntimeError('Valid result outside frozen reference set')
+    assert len(proposals) == budget
+    checkpoints = {'1M': curves[case['M']-1]}
+    if budget_multiplier == 2:
+        checkpoints['2M'] = curves[-1]
+    result = {'task': case['task'], 'difficulty': case['difficulty'], 'case_id': case['case_id'], 'method': 'history_baseline',
+        'M': case['M'], 'complete': True, 'budget': budget, 'llm': client.report(), 'proposals': proposals,
+        'checkpoints': checkpoints, 'elapsed_seconds': time.perf_counter()-start,
+        'max_retries': max_retries, 'replication': 'upstream_rounds'}
+    write(destination, result)
+    csv_write(folder / 'curves' / (stem + '.csv'), curves)
+    print(f"DONE {stem} " + ' '.join(f"RR@{tier}={value['RR']:.4f}" for tier, value in checkpoints.items()), flush=True)
+    return result
+
+
 def run_one(folder_text, case, method, library, budget_multiplier=2):
+    if method == 'history_baseline':
+        return run_one_upstream(folder_text, case, budget_multiplier)
     if method not in METHODS:
         raise ValueError('Unknown method: ' + method)
     if budget_multiplier not in (1, 2):
@@ -218,7 +306,6 @@ def final_audit(folder, cases, runs, protocol):
         stem = run['case_id'] + '__' + run['method']
         records = [json.loads(line) for line in (folder/'calls'/(stem+'.jsonl')).read_text(encoding='utf-8').splitlines()]
         curves = [json.loads(line) for line in (folder/'curves'/(stem+'.jsonl')).read_text(encoding='utf-8').splitlines()]
-        assert len(records) == len(curves) == run['llm']['calls'] == run['budget'] == len(run['proposals'])
         case = by_id[run['case_id']]
         assert run['budget'] == protocol['budget_multiplier'] * case['M']
         accumulator = CurveAccumulator(case)
@@ -227,28 +314,70 @@ def final_audit(folder, cases, runs, protocol):
         fixed = libraries[f"{case['task']}_{case['difficulty']}"]['prompt']
         expected_schedule = schedule_for(case)
         cumulative = Counter()
-        for index, (record, proposal, curve) in enumerate(zip(records, run['proposals'], curves)):
-            assert record['call'] == proposal['call'] == curve['calls'] == index+1
-            assert record['slot'] == index+1
-            target = expected_schedule[index] if run['method'] in STRATIFIED_METHODS else None
-            expected_prompt = build_prompt(adapter, replay_history, run['method'],
-                libraries[f"{case['task']}_{case['difficulty']}"], target)
-            assert record['prompt'] == expected_prompt
-            assert record['prompt'].endswith(fixed) == (run['method'] in LIBRARY_METHODS)
-            if run['method'] in STRATIFIED_METHODS:
-                assert curve['target_complexity'] == expected_schedule[index]
-            payload = adapter.parse(record['response']) if 'response' in record else None
-            assert json.loads(compact(payload)) == json.loads(compact(proposal['payload']))
-            verdict = adapter.evaluate(payload)
-            for k, v in verdict.items():
-                assert proposal[k] == v
-            independently = accumulator.add(payload, verdict, 'error' in record)
-            for metric, value in independently.items():
-                assert json.loads(compact(curve[metric])) == json.loads(compact(value))
-            history_add(case['task'], replay_history, replay_seen, payload)
-            for key in ['prompt_tokens', 'completion_tokens', 'total_tokens']:
-                cumulative[key] += (record.get('usage') or {}).get(key, 0)
-                assert curve['cumulative_' + key] == cumulative[key]
+        if run['method'] == 'history_baseline':
+            # Replicate the upstream round loop from saved records: one prompt per round,
+            # repeated across retries, with upstream prior-history semantics.
+            assert len(curves) == run['budget'] == len(run['proposals'])
+            assert len(records) == run['llm']['calls'] >= run['budget']
+            assert run['max_retries'] == MAX_RETRIES[case['task']]
+            by_slot = {}
+            for record in records:
+                by_slot.setdefault(record['slot'], []).append(record)
+            assert sorted(by_slot) == list(range(1, run['budget'] + 1))
+            for index, (proposal, curve) in enumerate(zip(run['proposals'], curves)):
+                round_records = by_slot[index + 1]
+                assert 1 <= len(round_records) <= run['max_retries']
+                assert len(round_records) == proposal['attempts'] == curve['attempts']
+                expected_prompt = adapter.upstream_prompt(replay_history)
+                assert all(record['prompt'] == expected_prompt for record in round_records)
+                payload = None
+                for record in round_records:
+                    if 'response' in record:
+                        payload = adapter.parse(record['response'])
+                        if payload is not None:
+                            break
+                assert json.loads(compact(payload)) == json.loads(compact(proposal['payload']))
+                verdict = adapter.evaluate(payload)
+                for k, v in verdict.items():
+                    assert proposal[k] == v
+                api_error = any('error' in record for record in round_records)
+                assert proposal['api_error'] == api_error
+                error_detail = None
+                if api_error:
+                    last_error = [r for r in round_records if 'error' in r][-1]['error']
+                    error_detail = upstream_error_detail(adapter, run['max_retries'], upstream_error_text(last_error))
+                upstream_history_add(adapter, case, replay_history, replay_seen, payload, error_detail)
+                independently = accumulator.add(payload, verdict, api_error)
+                for metric, value in independently.items():
+                    assert json.loads(compact(curve[metric])) == json.loads(compact(value))
+                for key in ['prompt_tokens', 'completion_tokens', 'total_tokens']:
+                    for record in round_records:
+                        cumulative[key] += (record.get('usage') or {}).get(key, 0)
+                    assert curve['cumulative_' + key] == cumulative[key]
+        else:
+            assert len(records) == len(curves) == run['llm']['calls'] == run['budget'] == len(run['proposals'])
+            for index, (record, proposal, curve) in enumerate(zip(records, run['proposals'], curves)):
+                assert record['call'] == proposal['call'] == curve['calls'] == index+1
+                assert record['slot'] == index+1
+                target = expected_schedule[index] if run['method'] in STRATIFIED_METHODS else None
+                expected_prompt = build_prompt(adapter, replay_history, run['method'],
+                    libraries[f"{case['task']}_{case['difficulty']}"], target)
+                assert record['prompt'] == expected_prompt
+                assert record['prompt'].endswith(fixed) == (run['method'] in LIBRARY_METHODS)
+                if run['method'] in STRATIFIED_METHODS:
+                    assert curve['target_complexity'] == expected_schedule[index]
+                payload = adapter.parse(record['response']) if 'response' in record else None
+                assert json.loads(compact(payload)) == json.loads(compact(proposal['payload']))
+                verdict = adapter.evaluate(payload)
+                for k, v in verdict.items():
+                    assert proposal[k] == v
+                independently = accumulator.add(payload, verdict, 'error' in record)
+                for metric, value in independently.items():
+                    assert json.loads(compact(curve[metric])) == json.loads(compact(value))
+                history_add(case['task'], replay_history, replay_seen, payload)
+                for key in ['prompt_tokens', 'completion_tokens', 'total_tokens']:
+                    cumulative[key] += (record.get('usage') or {}).get(key, 0)
+                    assert curve['cumulative_' + key] == cumulative[key]
         for key in cumulative:
             assert cumulative[key] == run['llm']['usage'][key]
         assert json.loads(compact(run['checkpoints']['1M'])) == curves[case['M']-1]
@@ -259,8 +388,9 @@ def final_audit(folder, cases, runs, protocol):
         checks.append({'case_id': run['case_id'], 'method': run['method'], 'calls': len(records),
                        'finish_reasons': run['llm']['finish_reason_counts'], 'api_errors': len(run['llm']['errors']),
                        'missing_usage': run['llm']['usage_missing_calls']})
-    assert sum(r['llm']['calls'] for r in runs) == protocol['expected_total_calls']
+    assert sum(r['budget'] for r in runs) == protocol['expected_total_calls']
+    assert sum(r['llm']['calls'] for r in runs) >= protocol['expected_total_calls']
     write(folder/'audit.json', {'passed': True, 'source_hashes_unchanged': True, 'curves_recomputed_from_raw_responses': True,
-          'calls_equal_proposals': True, 'fixed_libraries_verified': True, 'token_sums_match': True, 'checks': checks})
+          'proposals_equal_rounds': True, 'retries_within_limits': True, 'fixed_libraries_verified': True, 'token_sums_match': True, 'checks': checks})
     csv_write(folder/'all_call_curves.csv', sorted(all_curves, key=lambda r: (r['task'], r['difficulty'], r['case_id'], r['method'], r['calls'])))
     return all_curves

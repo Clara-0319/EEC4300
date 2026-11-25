@@ -13,6 +13,34 @@ def compact(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
 
 
+def upstream_error_text(record_error):
+    """Render a transport error in the upstream 'Error querying ...' style."""
+    kind = str(record_error.get('type') or 'unknown')
+    text = 'Error querying LLM: ' + kind
+    status = record_error.get('status')
+    if status is not None:
+        text += f' HTTP Error {status}'
+    return text
+
+
+def upstream_error_detail(adapter, max_retries, error_text):
+    """Boolean-style prior-history entry appended after a fully failed upstream round."""
+    return f'[ERROR after {max_retries} attempts] Type: {adapter.classify_error(error_text)} | {error_text}'
+
+
+def upstream_history_add(adapter, case, history, seen, payload, error_detail=None):
+    """Replicate upstream prior-history maintenance; shared by runs and audit replay."""
+    if payload is not None:
+        if case['task'] == '3d':
+            key = adapter.upstream_hash(payload)
+            if key in seen:
+                return
+            seen.add(key)
+        history.append(payload)
+    elif error_detail is not None and case['task'] == 'boolean':
+        history.append(error_detail)
+
+
 def rejected(reason='parse_or_space_error'):
     return {'in_space': False, 'valid': False, 'key': None, 'complexity': None, 'reason': reason}
 
@@ -66,6 +94,13 @@ class BooleanTask:
     def prompt(self, history):
         return self.bridge.prompt(history) + '\n' + self.rules
 
+    def upstream_prompt(self, history):
+        """Verbatim upstream create_prompt output; used by the replicated baseline."""
+        return self.bridge.prompt(history)
+
+    def classify_error(self, error_text):
+        return self.bridge.runner._classify_error(error_text)
+
 
 def voxel_key(payload):
     value = [[list(row) for row in layer] for layer in payload]
@@ -92,6 +127,16 @@ class VoxelTask:
 
     def prompt(self, history):
         return self.bridge.prompt(history) + '\nReturn only one complete Structure in the required format. Complexity is total occupied voxels.'
+
+    def upstream_prompt(self, history):
+        """Verbatim upstream create_prompt output; used by the replicated baseline."""
+        return self.bridge.prompt(history)
+
+    def upstream_hash(self, payload):
+        return self.bridge.data.Structure3D(payload).get_hash()
+
+    def classify_error(self, error_text):
+        return self.bridge.runner._classify_error(error_text)
 
 
 def graph_key(edges):
@@ -133,6 +178,14 @@ class CausalTask:
     def prompt(self, history):
         objects = [self.module.CausalGraph.from_dict(p) for p in history]
         return self.runner.create_prompt(self.case['observations'], objects) + '\nComplexity is the number of distinct directed edges.'
+
+    def upstream_prompt(self, history):
+        """Verbatim upstream create_prompt output; used by the replicated baseline."""
+        objects = [self.module.CausalGraph.from_dict(p) for p in history]
+        return self.runner.create_prompt(self.case['observations'], objects)
+
+    def classify_error(self, error_text):
+        return self.runner._classify_error(error_text)
 
 
 def adapter_for(case):
