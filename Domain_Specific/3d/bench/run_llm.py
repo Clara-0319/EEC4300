@@ -96,6 +96,8 @@ def main() -> None:
     ap.add_argument("--resume", default="", help="existing result file to append to")
     ap.add_argument("--out", default="", help="result path (default derived from arm/tag/slots)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--thinking", choices=["enabled", "disabled"], default=None,
+                    help="DeepSeek thinking mode; default = server default (enabled)")
     args = ap.parse_args()
 
     out = Path(args.out) if args.out else RESULTS / (
@@ -139,7 +141,8 @@ def main() -> None:
         payload = {"config": {"arm": args.arm, "slots": args.slots, "n_samples": len(rows),
                               "seed": args.seed, "tag": args.tag,
                               "ids": [r["observation_set_id"] for r in rows],
-                              "model": "deepseek-flash", "temperature": 0.7},
+                              "model": "deepseek-flash", "temperature": 0.7,
+                              "thinking": args.thinking},
                    "aggregate": agg, "by_bucket": by, "per_sample": rows}
         out.parent.mkdir(parents=True, exist_ok=True)
         with open(out, "w", encoding="utf-8") as f:
@@ -152,7 +155,8 @@ def main() -> None:
         cells = core.sample_cells(s)
         k = len(core.ground_truth(cells)) if args.slots == "gt" else int(args.slots)
         try:
-            row = llm_arms.run_arm(args.arm, s, k, client, budget, rng_seed=args.seed)
+            row = llm_arms.run_arm(args.arm, s, k, client, budget, rng_seed=args.seed,
+                                       thinking=args.thinking)
         except RuntimeError as e:
             print(f"stop: {e}")
             break

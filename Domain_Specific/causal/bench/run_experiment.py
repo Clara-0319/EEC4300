@@ -76,7 +76,7 @@ ARMS = {
 
 
 def run_arm(name, k, manifest_path, dataset_path, provider, limit, state_budget, seed,
-            verbose, workers=1, tag=""):
+            verbose, workers=1, tag="", thinking=None):
     missing = [p for p in (dataset_path, manifest_path) if not Path(p).exists()]
     if missing:
         raise SystemExit(
@@ -94,7 +94,7 @@ def run_arm(name, k, manifest_path, dataset_path, provider, limit, state_budget,
     fn = ARMS[name]
     llm = None
     if name in ("llm_baseline", "c3gen", "c3gen_hybrid"):
-        llm = make_llm(provider)
+        llm = make_llm(provider, thinking=thinking)
 
     rows, t0 = [], time.time()
     tot = {"tokens": 0, "cost": 0.0, "calls": 0, "states": 0, "wall": 0.0}
@@ -164,7 +164,7 @@ def run_arm(name, k, manifest_path, dataset_path, provider, limit, state_budget,
     out = {
         "config": {"arm": name, "k": k, "manifest": str(manifest_path),
                    "dataset": str(dataset_path), "provider": provider, "seed": seed,
-                   "tag": tag, "n_samples": len(rows)},
+                   "tag": tag, "n_samples": len(rows), "thinking": thinking},
         "aggregate": agg,
         "per_sample": rows,
     }
@@ -260,6 +260,8 @@ def main():
     ap.add_argument("--tag", default="", help="suffix for the result filename, e.g. sub36")
     ap.add_argument("--workers", type=int, default=1,
                     help="parallel samples for the LLM arms (each sample is independent)")
+    ap.add_argument("--thinking", choices=["enabled", "disabled"], default=None,
+                    help="DeepSeek thinking mode; default = server default (enabled, effort high)")
     args = ap.parse_args()
 
     if args.table:
@@ -275,7 +277,7 @@ def main():
         data.build_manifest(args.dataset, args.manifest, per_bucket=args.per_bucket)
     run_arm(args.arm, args.k, args.manifest, args.dataset, args.provider,
             args.limit, args.state_budget, args.seed, verbose=not args.quiet,
-            workers=args.workers, tag=args.tag)
+            workers=args.workers, tag=args.tag, thinking=args.thinking)
 
 
 if __name__ == "__main__":
