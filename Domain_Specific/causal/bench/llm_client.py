@@ -62,13 +62,20 @@ class DeepSeekClient:
     def __init__(self, model: str = "deepseek-flash", api_key: Optional[str] = None,
                  temperature: float = 0.7, max_tokens: int = 40960,
                  base_url: str = "https://api.deepseek.com",
-                 system_prompt: str = SYSTEM_PROMPT, timeout: int = 180):
+                 system_prompt: str = SYSTEM_PROMPT, timeout: int = 180,
+                 thinking: Optional[str] = None):
         if not api_key:
             raise ValueError("DeepSeek API key is required")
+        if thinking not in (None, "enabled", "disabled"):
+            raise ValueError("thinking must be None, 'enabled' or 'disabled'")
         self.model = model
         self.api_key = api_key
         self.temperature = temperature
         self.max_tokens = max_tokens
+        # DeepSeek documents {"thinking": {"type": "disabled"}} to switch the model's
+        # chain-of-thought off (OpenAI-format endpoint).  None keeps the server default
+        # (thinking enabled, effort "high").
+        self.thinking = thinking
         self.base_url = base_url.rstrip("/")
         self.system_prompt = system_prompt
         self.timeout = timeout
@@ -94,6 +101,8 @@ class DeepSeekClient:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
+        if self.thinking:
+            payload["thinking"] = {"type": self.thinking}
         resp = requests.post(
             f"{self.base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self.api_key}",
@@ -169,7 +178,8 @@ class RetryingLLM:
 
 
 def make_llm(provider: str = "deepseek", model: Optional[str] = None,
-             temperature: float = 0.7, api_key: Optional[str] = None) -> Any:
+             temperature: float = 0.7, api_key: Optional[str] = None,
+             thinking: Optional[str] = None) -> Any:
     if provider == "deepseek":
         key = resolve_api_key(api_key)
         if not key:
@@ -179,7 +189,7 @@ def make_llm(provider: str = "deepseek", model: Optional[str] = None,
                 "  2. environment variable DEEPSEEK_API_KEY"
             )
         return RetryingLLM(DeepSeekClient(model=model or "deepseek-flash", api_key=key,
-                                          temperature=temperature))
+                                          temperature=temperature, thinking=thinking))
     if provider == "mock":
         return MockLLM()
     raise ValueError(f"unknown provider {provider}")
