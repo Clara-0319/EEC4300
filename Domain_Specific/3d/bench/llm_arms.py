@@ -86,15 +86,21 @@ def make_client(api_key: str):
 
 
 def ask(client, prompt: str, budget: Budget, model: str = "deepseek-flash",
-        temperature: float = 0.7, attempts: int = 4) -> str:
+        temperature: float = 0.7, attempts: int = 4,
+        thinking: Optional[str] = None) -> str:
+    extra = {"thinking": {"type": thinking}} if thinking else None
     last = None
     for i in range(attempts):
         try:
-            resp = client.chat.completions.create(
+            kwargs = dict(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
             )
+            if extra:
+                # DeepSeek: {"thinking": {"type": "disabled"}} turns chain-of-thought off
+                kwargs["extra_body"] = extra
+            resp = client.chat.completions.create(**kwargs)
             budget.add(resp.usage)
             return resp.choices[0].message.content or ""
         except RuntimeError:
@@ -199,7 +205,7 @@ def parse_a0(bench, text: str, cells) -> Tuple:
 # ---------------------------------------------------------------- arms
 
 def run_arm(arm: str, sample: Dict, k: int, client, budget: Budget,
-            rng_seed: int = 0) -> Dict:
+            rng_seed: int = 0, thinking: Optional[str] = None) -> Dict:
     cells = core.sample_cells(sample)
     top_view = sample["top_view"]
     gt = core.ground_truth(cells)
@@ -211,7 +217,7 @@ def run_arm(arm: str, sample: Dict, k: int, client, budget: Budget,
     for _ in range(k):
         if arm == "paper":
             p = prompt_a0(bench, top_view, priors)
-            text = ask(client, p, budget)
+            text = ask(client, p, budget, thinking=thinking)
             struct = bench.parse_llm_response(text)
             h = structure_to_heights(struct, cells) if struct is not None else INVALID
             if struct is not None:
@@ -219,7 +225,7 @@ def run_arm(arm: str, sample: Dict, k: int, client, budget: Budget,
         else:
             already = list(dict.fromkeys(emitted)) if arm == "schema_dedupe" else []
             p = prompt_a1(cells, top_view, already)
-            text = ask(client, p, budget)
+            text = ask(client, p, budget, thinking=thinking)
             h = parse_a1(text, len(cells))
         emitted.append(h)
         if h != INVALID:
