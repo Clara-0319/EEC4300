@@ -52,32 +52,30 @@ R/cap 1.000 against 0.627 / 0.495 / 0.556 for random sampling at k = 5 / 20 / 50
 
 ## Results on the LLM (`deepseek-flash`, temperature 0.7)
 
-Same model, same samples, same `k`; only the prompt and the repair step differ.
+Settings: 20 paired samples (identical ids for both arms), `k` = 20,
+`thinking: {"type": "disabled"}` (chain of thought off; reproducible with `--thinking disabled`),
+temperature 0.7. Same model, same samples, same `k`; only the prompt and the repair step differ.
 
-| Setting | Samples | Arm | Validity | Uniqueness | Recovery | R/cap | Calls | Tokens | Cost |
-|---|---|---|---|---|---|---|---|---|---|
-| k = 20 | 6 paired | `llm_baseline` (paper prompt) | 1.000 | .983 | .163 | .983 | 120 | 323 k | $0.33 |
-| k = 20 | 6 paired | `c3gen` | 1.000 | **1.000** | .166 | **1.000** | 6 | 39 k | $0.04 |
-| k = 5 | 10 paired | `llm_baseline` | 1.000 | .720 | .633 | 1.000 | 50 | 137 k | $0.15 |
-| k = 5 | 10 paired | `c3gen` | .720 | .720 | .633 | 1.000 | 14 | 105 k | $0.12 |
-| k = 20 | 28 | `c3gen` | .529 | .529 | .669 | .964 | 44 | 393 k | $0.45 |
-| k = 20 | 10 | `c3gen_hybrid` | .480 | .480 | .734 | **1.000** | 16 | 127 k | $0.15 |
+| Arm | Validity | Uniqueness | Recovery | R/cap | Calls | Tokens | Cost |
+|---|---|---|---|---|---|---|---|
+| `llm_baseline` (paper prompt) | .412 | .205 | .375 | .478 | 400 | 614 k | $0.55 |
+| `c3gen` | .497 | .497 | .449 | **.776** | 39 | 39 k | **$0.03** |
 
-How to read this table:
+Paired over the same 20 sample ids: mean difference **+0.2975**, bootstrap 95 % CI
+**[+0.108, +0.478]**, Wilcoxon **p = 0.026**, wins / ties / losses **10 / 6 / 4**. Cost is **20.7x**
+lower and calls **10.3x** fewer.
 
-- At k = 20 with `|GT|` in 96-192 both arms sit at the ceiling. The only gap is 2 of 6 samples
-  where the baseline submitted a duplicate (`U = .950`), so coverage is essentially tied and the
-  difference is cost: 20x fewer calls, 7.4x cheaper.
-- At k = 5, four of the ten samples have `|GT| < 5`, so at most `|GT|/5` distinct graphs fit the
-  slots. The baseline fills leftover slots with duplicates and reports `V = 1.000`; C3-Gen refuses
-  duplicates, so its `V = U = .720`, the structural ceiling. `U`, `R` and `R/cap` are identical —
-  the `V` gap is a filling convention, not a capability gap.
-- The two rows with `V = U < 1` at k = 20 are samples where 20 distinct compatible graphs do not
-  exist; same ceiling, same reason. Filling the empty slots with duplicates is what the baseline
-  does there.
-- 6 and 10 samples are directional only; they are not a significance test. The cost ratio holds on
-  every one of the six paired samples.
+By |GT| stratum (R/cap, baseline vs C3-Gen): 1 (n = 4) 1.000 / 1.000; 5-16 (n = 4) .592 / .617;
+17-64 (n = 6) .333 / **.675**; 65-256 (n = 6) .200 / **.833**. The gap opens only once the search
+space is large: with a thin ground truth the baseline hits the cap by luck.
 
+How to read the two `V` values:
+
+- `Validity = fill x purity`. The baseline fills 93 % of its slots but only 45 % of what it emits is
+  a valid graph (`purity = .452`); C3-Gen fills 50 % of its slots and everything it emits is valid
+  (`purity = 1.000`). The comparison that matters is `Uniqueness` / `R/cap`.
+- `U = .497` is the structural ceiling here, not a shortfall: 8 of the 20 samples have `|GT| < 20`,
+  so 20 distinct compatible graphs do not exist for them and no method can score higher.
 ## Two facts that decide how these numbers should be read
 
 1. **`Recovery = min(k, |GT|) / |GT|` is a structural ceiling.** Any method emitting `k` distinct
@@ -116,10 +114,12 @@ python causal/bench/run_experiment.py --arm llm_baseline --k 5 \
     --manifest causal/datasets/node06/manifest_n6_all120.json
 ```
 
-Model `deepseek-flash`, temperature 0.7. It is verbose when asked for many graphs (5-16 k
-completion tokens per call) and samples with small `|GT|` are the expensive ones, so probe with
-`--limit 1` first. `RetryingLLM` retries 6 times with backoff and logs to
-`causal/results/bench/logs/api_errors.log`; it raises instead of silently recording an empty answer.
+Model `deepseek-flash`, temperature 0.7. Add `--thinking disabled` to turn the chain of thought
+off; without the flag the server default (enabled) is used and the run is recorded as such in the
+result file. It is verbose when asked for many graphs (5-16 k completion tokens per call) and samples
+with small `|GT|` are the expensive ones, so probe with `--limit 1` first. `RetryingLLM` retries 6
+times with backoff and logs to `causal/results/bench/logs/api_errors.log`; it raises instead of
+silently recording an empty answer.
 
 ## Determinism
 

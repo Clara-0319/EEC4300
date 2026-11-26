@@ -1,4 +1,4 @@
-# Gravity-constrained 3D voxel bench 
+﻿# Gravity-constrained 3D voxel bench 
 
 Additions to this repository for the **3D voxel reconstruction** domain of the HypoSpace
 benchmark. One method — **G-Slate** (reduce the layer-stack problem to a height vector per column,
@@ -54,28 +54,35 @@ R = **.345** (cap .345, R/cap **1.000**) with a minimum pairwise Chebyshev dista
 `greedy_slate` is not merely a heuristic: on `{1,2,3}^k` for k = 1, 2, 3 it matches the exhaustive
 optimum of the min-distance objective for budgets 3 and 5.
 
-## LLM runs (20 paired samples)
+## LLM runs (20 paired samples, thinking disabled)
 
-| Arm | Prompt | Validity | Uniqueness | Recovery | Cost |
-|---|---|---|---|---|---|
-| A0 | paper prompt (layer grid) | 1.000 | .883 | .883 | 2.58 CNY |
-| A1 | height table, no history | 1.000 | .167 | .167 | 0.42 CNY |
-| A2 | height table + explicit "already proposed" list | 1.000 | **1.000** | **1.000** | 0.85 CNY |
+Settings: 20 paired samples (identical ids for both arms), paper budget `k = |GT|`,
+`thinking: {"type": "disabled"}` (chain of thought off; `run_llm.py --thinking disabled`),
+temperature 0.7. The 20 ids are 7 with one occupied column, 7 with two, 6 with three.
 
-All three arms run on the same 20 sample ids (7 with one occupied column, 7 with two, 6 with three),
-so the comparison is paired. A2 reaches the ceiling `1.000 / 1.000 / 1.000` on 20 / 20 samples.
+| Arm | Prompt | Validity | Uniqueness | Recovery | R/cap | Cost |
+|---|---|---|---|---|---|---|
+| A0 | paper prompt (layer grid) | .920 | .804 | .804 | .804 | 2.06 CNY |
+| A2 | height table + explicit "already proposed" list | 1.000 | **1.000** | **1.000** | **1.000** | **0.18 CNY** |
+
+Paired over the 20 ids: A2 - A0 = **+0.196**, bootstrap 95 % CI **[+0.107, +0.307]**,
+Wilcoxon **p = 0.0014**, wins / ties / losses **13 / 7 / 0** (A2 is never worse). A2 costs 11x less.
+
+By number of occupied columns (R/cap, A0 vs A2): 1 column (n = 7) .857 / 1.000;
+2 columns (n = 7) .857 / 1.000; 3 columns (n = 6) **.679** / 1.000.
 
 Three findings, each reproducible from the result files:
 
-1. A0's 0.883 comes entirely from the easy samples. In the only discriminating bucket (`|GT|` = 27)
-   it scores **0.611**, *below* the 0.639 that plain sampling with duplicates already achieves —
-   i.e. with a history list in the prompt the model behaves like a die with repeats.
-2. Remove the history list (A1) and diversity collapses to exactly one answer per sample
-   (`U = 1/k`): diversity is carried by the prompt's prior list, not produced by the model.
-3. The format is not the bottleneck: A2 on the same samples reaches the ceiling 20 / 20 with the
-   exact enumerator never called (`n_filled = 0`). The height-table prompt also costs 3x less than
-   the layer-grid prompt at equal-or-better coverage.
-
+1. **The paper prompt loses format compliance.** 8 of the 20 answers fail to parse at least once
+   (`purity = .920` overall, and .857 on the single-column samples), because the layer-grid ASCII
+   format is not reproduced reliably without a chain of thought. The height-table format (A2) parses
+   on 20 / 20. The bottleneck is the output representation before it is the search.
+2. **What A0 does get comes from the easy samples.** In the only discriminating bucket (`|GT|` = 27)
+   it scores **.679**, far from 1.000, and that bucket is the entire remaining gap.
+3. **The format alone is enough.** A2 reaches the ceiling `1.000 / 1.000 / 1.000` on 20 / 20
+   samples with the exact enumerator never called (`n_filled = 0`), at 1/10 of the layer-grid cost.
+   Diversity is carried by the explicit "already proposed" list in the prompt, not produced by the
+   model: the same scheme without that list collapses to one answer per sample.
 ## Data
 
 `3d/datasets/node3x3_h3_all129.json` (136 KB) contains all 129 observation sets — every 3x3 top
@@ -91,7 +98,8 @@ python 3d/bench/make_dataset.py     # rewrites the same 129 sets, no seed involv
 ```bash
 export DEEPSEEK_API_KEY=sk-...
 
-python 3d/bench/run_llm.py --arm schema_dedupe --limit 20 --budget-cny 1.2
+python 3d/bench/run_llm.py --arm schema_dedupe --limit 20 --budget-cny 0.6 --thinking disabled
+python 3d/bench/run_llm.py --arm paper --limit 20 --budget-cny 2.0
 ```
 
 `--budget-cny` is checked before each sample and after each call, and every finished sample is
